@@ -56,7 +56,7 @@ Or pass it directly as a command-line argument (see Usage below).
 
 ```bash
 # Navigate to the skill directory
-cd /Users/chenyan12/workspace/value-snapshot
+cd value-snapshot
 
 # Analyze a company (using environment variable for API key)
 python scripts/fetch_financials.py TSLA | python scripts/calculate_metrics.py -
@@ -83,8 +83,8 @@ python scripts/compare_companies.py GOOG MSFT your_api_key_here
 Add to your `~/.bashrc` or `~/.zshrc`:
 
 ```bash
-alias value-snapshot='python /Users/chenyan12/workspace/value-snapshot/scripts/fetch_financials.py "$1" | python /Users/chenyan12/workspace/value-snapshot/scripts/calculate_metrics.py -'
-alias compare-stocks='python /Users/chenyan12/workspace/value-snapshot/scripts/compare_companies.py'
+alias value-snapshot='python value-snapshot/scripts/fetch_financials.py "$1" | python value-snapshot/scripts/calculate_metrics.py -'
+alias compare-stocks='python value-snapshot/scripts/compare_companies.py'
 ```
 
 Then simply:
