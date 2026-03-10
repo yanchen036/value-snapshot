@@ -21,30 +21,39 @@ import time
 import re
 
 
+# Module-level cache: company_tickers.json is ~4MB and is the same for all tickers.
+# Fetching it once per process (instead of once per ticker) avoids SEC rate limiting.
+_SEC_TICKER_TO_CIK = None
+
+def _load_sec_ticker_map():
+    """Download company_tickers.json once and build a ticker→CIK lookup dict."""
+    global _SEC_TICKER_TO_CIK
+    if _SEC_TICKER_TO_CIK is not None:
+        return _SEC_TICKER_TO_CIK
+
+    headers = {
+        'User-Agent': 'ValueSnapshot/1.0 (contact@example.com)',
+        'Accept-Encoding': 'gzip, deflate'
+    }
+    url = "https://www.sec.gov/files/company_tickers.json"
+    response = requests.get(url, headers=headers, timeout=15)
+    response.raise_for_status()
+    data = response.json()
+
+    # Build uppercase ticker → zero-padded CIK dict
+    _SEC_TICKER_TO_CIK = {
+        item['ticker'].upper(): str(item['cik_str']).zfill(10)
+        for item in data.values()
+        if item.get('ticker')
+    }
+    return _SEC_TICKER_TO_CIK
+
+
 def get_cik_from_ticker(ticker):
-    """Get CIK number from ticker using SEC company tickers JSON."""
+    """Get CIK number from ticker using SEC company tickers JSON (cached in memory)."""
     try:
-        headers = {
-            'User-Agent': 'ValueSnapshot/1.0 (contact@example.com)',
-            'Accept-Encoding': 'gzip, deflate'
-        }
-
-        # SEC provides a JSON file mapping tickers to CIKs
-        url = "https://www.sec.gov/files/company_tickers.json"
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-
-        data = response.json()
-
-        # Search for ticker (case insensitive)
-        ticker_upper = ticker.upper()
-        for item in data.values():
-            if item.get('ticker', '').upper() == ticker_upper:
-                # CIK is stored as integer, pad to 10 digits
-                cik = str(item['cik_str']).zfill(10)
-                return cik
-
-        return None
+        ticker_map = _load_sec_ticker_map()
+        return ticker_map.get(ticker.upper())
     except Exception as e:
         print(f"Warning: Could not fetch CIK for {ticker}: {e}", file=sys.stderr)
         return None
@@ -208,8 +217,22 @@ def fetch_from_massive_financials(ticker, api_key):
             "timeframe": "ttm",
             "limit": 1
         }
-        financials_response = requests.get(financials_url, headers=headers, params=financials_params, timeout=10)
-        financials_response.raise_for_status()
+
+        # Retry on 429 with increasing waits
+        financials_response = None
+        for attempt in range(4):
+            financials_response = requests.get(financials_url, headers=headers, params=financials_params, timeout=10)
+            if financials_response.status_code == 429:
+                wait = 15 * (attempt + 1)
+                print(f"\n  Rate limited on financials for {ticker} (attempt {attempt+1}/4), waiting {wait}s...", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            financials_response.raise_for_status()
+            break
+        else:
+            print(f"  ✗ Exceeded retry limit for {ticker} financials", file=sys.stderr)
+            return None
+
         financials_data = financials_response.json()
 
         if financials_data.get('status') != 'OK' or not financials_data.get('results'):
@@ -238,8 +261,11 @@ def fetch_from_massive_financials(ticker, api_key):
             total_cash = balance_sheet.get('other_current_assets', {}).get('value', 0)
 
         net_ppe = balance_sheet.get('fixed_assets', {}).get('value', 0)
-        stockholder_equity = balance_sheet.get('equity', {}).get('value') or \
-                            balance_sheet.get('equity_attributable_to_parent', {}).get('value')
+        # Use equity_attributable_to_parent first — excludes non-controlling interests
+        # and insurance subsidiary policyholder funds (e.g. KKR/Global Atlantic).
+        # Fall back to total equity only if parent equity is unavailable.
+        stockholder_equity = balance_sheet.get('equity_attributable_to_parent', {}).get('value') or \
+                            balance_sheet.get('equity', {}).get('value')
 
         currency = income_stmt.get('revenues', {}).get('unit', 'USD').upper()
         fiscal_period = financial_report.get('fiscal_period', 'TTM')
@@ -304,6 +330,115 @@ def fetch_market_data_from_massive(ticker, api_key):
         return None
 
 
+def fetch_52week_data(ticker, api_key):
+    """
+    Fetch 52-week high/low price data from Massive.com Aggregates API.
+
+    Uses daily price data from the last 365 days to calculate:
+    - 52-week high
+    - 52-week low
+    - Current proximity to 52-week low/high
+
+    Args:
+        ticker: Stock ticker symbol
+        api_key: Massive.com API key
+
+    Returns:
+        Dictionary with 52-week price data:
+        {
+            "current_price": 125.50,
+            "52_week_high": 180.25,
+            "52_week_low": 98.75,
+            "proximity_to_low": 0.33,   # 33% above 52-week low
+            "proximity_to_high": 0.85,  # 85% below 52-week high
+            "data_date": "2024-03-01"
+        }
+
+        Returns None if data unavailable or error occurs.
+    """
+    base_url = "https://api.massive.com"
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    try:
+        # Calculate date range (last 365 days)
+        from datetime import datetime, timedelta
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=365)
+
+        # Format dates as YYYY-MM-DD
+        start_str = start_date.strftime('%Y-%m-%d')
+        end_str = end_date.strftime('%Y-%m-%d')
+
+        # Fetch daily aggregates
+        aggregates_url = f"{base_url}/v2/aggs/ticker/{ticker.upper()}/range/1/day/{start_str}/{end_str}"
+        params = {
+            'adjusted': 'true',
+            'sort': 'asc',
+            'limit': 50000  # Get all data points
+        }
+
+        time.sleep(1.0)  # Rate limiting - wait 1 second to avoid 429 errors
+        response = requests.get(aggregates_url, headers=headers, params=params, timeout=15)
+
+        # Handle rate limiting
+        if response.status_code == 429:
+            print(f"  Rate limit hit for {ticker}, waiting 5 seconds...", file=sys.stderr)
+            time.sleep(5)
+            response = requests.get(aggregates_url, headers=headers, params=params, timeout=15)
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        # Accept both 'OK' and 'DELAYED' status (DELAYED means slightly delayed data, which is normal)
+        if data.get('status') not in ['OK', 'DELAYED'] or not data.get('results'):
+            print(f"  Warning: 52-week data status: {data.get('status')}, results: {len(data.get('results', []))}", file=sys.stderr)
+            return None
+
+        results = data['results']
+
+        # Extract high and low prices from each day
+        highs = [bar['h'] for bar in results if 'h' in bar]
+        lows = [bar['l'] for bar in results if 'l' in bar]
+        closes = [bar['c'] for bar in results if 'c' in bar]
+
+        if not highs or not lows or not closes:
+            return None
+
+        # Calculate 52-week high/low
+        week_52_high = max(highs)
+        week_52_low = min(lows)
+        current_price = closes[-1]  # Most recent close
+
+        # Calculate proximity metrics
+        # proximity_to_low: 0.00 = at 52w low, 1.00 = at 52w high
+        if week_52_high != week_52_low:
+            proximity_to_low = (current_price - week_52_low) / (week_52_high - week_52_low)
+            proximity_to_high = (week_52_high - current_price) / (week_52_high - week_52_low)
+        else:
+            # Edge case: flat trading range
+            proximity_to_low = 0.0
+            proximity_to_high = 0.0
+
+        # Get date of most recent data point
+        data_date = datetime.fromtimestamp(results[-1]['t'] / 1000).strftime('%Y-%m-%d')
+
+        return {
+            'current_price': current_price,
+            '52_week_high': week_52_high,
+            '52_week_low': week_52_low,
+            'proximity_to_low': proximity_to_low,
+            'proximity_to_high': proximity_to_high,
+            'data_date': data_date,
+            'data_points': len(results)
+        }
+
+    except Exception as e:
+        # Log error for debugging
+        print(f"  Warning: 52-week data failed for {ticker}: {e}", file=sys.stderr)
+        return None
+
+
 def fetch_company_data(ticker, api_key=None):
     """
     Fetch TTM financial data for a given ticker.
@@ -329,6 +464,17 @@ def fetch_company_data(ticker, api_key=None):
 
     if financial_data:
         print(f"✓ Successfully fetched from SEC EDGAR (CIK: {financial_data.get('cik')})", file=sys.stderr)
+        # Always overlay Massive.com financials for operating_income and equity.
+        # Massive.com has more timely TTM filings and uses equity_attributable_to_parent
+        # which gives accurate P/E and P/B (avoids stale SEC data and NCI inflation).
+        time.sleep(0.5)  # Rate limit guard before extra Massive.com call
+        massive_fin = fetch_from_massive_financials(ticker, api_key)
+        if massive_fin:
+            if massive_fin.get('operating_income_ttm') is not None:
+                financial_data['operating_income_ttm'] = massive_fin['operating_income_ttm']
+            if massive_fin.get('total_stockholder_equity') is not None:
+                financial_data['total_stockholder_equity'] = massive_fin['total_stockholder_equity']
+            print("✓ P/E and P/B fields overridden with Massive.com data", file=sys.stderr)
     else:
         print("✗ SEC EDGAR failed, trying Massive.com API (fallback)...", file=sys.stderr)
         # FALLBACK: Try Massive.com API

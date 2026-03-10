@@ -1,6 +1,6 @@
 ---
 name: value-snapshot
-description: Quick value investing analysis for public companies using Li Lu's methodology. Generates 5-minute financial snapshots showing operating earnings power and capital efficiency (RODC). Calculates P/B, P/E, deployed capital, and RODC following Li Lu's framework from his Columbia masterclass. Use when user requests financial analysis, value investing metrics, company snapshots, or company comparisons. Triggered by requests like "analyze [TICKER]", "value snapshot for [company]", "compare GOOG and MSFT", "which is better PDD or BABA", or "Li Lu analysis of [ticker]".
+description: Quick value investing analysis for public companies using Li Lu's methodology. Generates 5-minute financial snapshots showing operating earnings power and capital efficiency (RODC). Calculates P/B, P/E, deployed capital, and RODC following Li Lu's framework from his Columbia masterclass. Also includes a company screening system to find quality businesses trading near 52-week lows. Use when user requests financial analysis, value investing metrics, company snapshots, company comparisons, or value stock screening. Triggered by requests like "analyze [TICKER]", "value snapshot for [company]", "compare GOOG and MSFT", "which is better PDD or BABA", "Li Lu analysis of [ticker]", "screen for value stocks", "find companies near 52-week lows", "run a deep value screen", or "screen the S&P 500".
 ---
 
 # Value Snapshot - Li Lu's Methodology
@@ -47,9 +47,14 @@ python scripts/fetch_financials.py TICKER [API_KEY]
 3. **Fallback:** Massive.com financials API if SEC EDGAR fails
 
 The script fetches:
-- Income statement (TTM): Revenue, Operating Income, Operating Margin
-- Balance sheet (latest): Cash, Current Assets/Liabilities, PP&E, Goodwill
-- Market data: Market cap, shares outstanding, current price
+- Income statement **(TTM)**: Revenue, Operating Income, Operating Margin
+- Balance sheet **(most recent filing snapshot — latest 10-Q or 10-K)**: Cash, Current Assets/Liabilities, PP&E, Goodwill
+- Market data **(real-time)**: Market cap, shares outstanding, current price
+
+**Data timing note:**
+- TTM income metrics (revenue, operating income, margin) roll the last four quarters.
+- Balance sheet items are a point-in-time snapshot; they do NOT roll. A large acquisition or capital raise after the last 10-Q filing will not yet be reflected.
+- Market cap and price are always real-time from Massive.com regardless of which source was used for financials.
 
 **Output:** JSON with all required financial data
 
@@ -100,19 +105,19 @@ Format the output clearly with context:
 VALUE SNAPSHOT: [Company Name] ([TICKER])
 Date: [YYYY-MM-DD]
 
-📊 OPERATING METRICS (TTM)
+📊 OPERATING METRICS (TTM — trailing twelve months)
   Revenue:              $XX.XXB USD
   Operating Margin:     XX.XX%
   Operating Earnings:   $X.XXB USD ⭐ [Most important number]
 
-💰 BOOK VALUE BREAKDOWN
+💰 BOOK VALUE BREAKDOWN (most recent filing snapshot)
   Cash & Liquid Assets: $XX.XXB
   Working Capital:      $XX.XXB
   Fixed Assets (PP&E):  $X.XXB
   Goodwill:             $X.XXB [excluded]
   Tangible Book Value:  $XX.XXB
 
-🎯 VALUATION & CAPITAL EFFICIENCY
+🎯 VALUATION & CAPITAL EFFICIENCY (market data real-time; deployed capital from balance sheet snapshot)
   Market Cap:           $XXX.XXB
   Enterprise Value:     $XX.XXB
   Deployed Capital:     $XX.XXB
@@ -189,6 +194,135 @@ python scripts/compare_companies.py PDD BABA AMZN
 
 **See `references/interpretation.md` for detailed benchmarks and decision frameworks.**
 
+## Company Screening
+
+When the user wants to screen the market for investment candidates (e.g., "screen for value stocks", "find quality companies near 52-week lows", "run a deep value screen"):
+
+### Use `scripts/screen_companies.py`
+
+**Setup (first time):**
+```bash
+conda activate cc_financial
+pip install pandas tqdm requests
+export MASSIVE_API_KEY=your_api_key_here
+```
+
+**Basic usage:**
+```bash
+cd scripts
+
+# Default preset: quality companies near 52-week lows
+python screen_companies.py
+
+# Use a specific preset
+python screen_companies.py --preset deep_value
+
+# List all available presets
+python screen_companies.py --list-presets
+```
+
+**What it does (5-step workflow):**
+1. Build company universe (S&P 500 ~500 companies, or small/mid-cap)
+2. Fetch financial data for each company (with smart SQLite caching)
+3. Apply filters (52w low proximity, RODC, P/E, P/B, margins)
+4. Sort and rank by proximity to 52-week low, then by RODC
+5. Export `screening_results.md` + `screening_results_summary.md`
+
+### Available Presets
+
+| Preset | Description | Key Criteria |
+|--------|-------------|--------------|
+| **52_week_low_quality** (default) | Quality companies near 52w lows | RODC >30%, within 20% of 52w low, P/E <15x, P/B <2.0x, margin >10% |
+| **deep_value** | Extreme value opportunities | Within 15% of 52w low, P/E <12x, P/B <1.5x, positive working capital |
+| **li_lu_classic** | Classic Li Lu methodology | RODC >50%, P/E <10x, P/B <1.5x, margin >15% |
+| **cash_fortress** | Strong cash near 52w lows | Cash >25% of market cap, within 30% of 52w low |
+| **quality_any_price** | Highest quality regardless of price | RODC >40%, margin >20%, no valuation filters |
+
+### Custom Filters
+
+```bash
+# Custom RODC and P/E thresholds
+python screen_companies.py --min-rodc 25 --max-pe 12
+
+# Companies within 10% of 52-week low
+python screen_companies.py --max-proximity 0.10
+
+# Combine multiple filters
+python screen_companies.py --min-rodc 30 --max-pe 15 --max-proximity 0.15 --min-margin 10
+
+# Top 30 results only
+python screen_companies.py --top 30
+
+# Custom output file
+python screen_companies.py --output my_screen.md
+```
+
+### Cache Management
+
+```bash
+# Force refresh all data (ignore cache)
+python screen_companies.py --force-refresh
+
+# Use cached data only (no API calls)
+python screen_companies.py --offline
+
+# Change cache TTL to 3 days (default: 7)
+python screen_companies.py --cache-ttl 3
+```
+
+**Cache location:** `~/.value_snapshot/cache/screening.db`
+
+### All Command-Line Options
+
+```
+--preset PRESET         Use preset configuration
+--list-presets          List all available presets
+--universe {sp500,small_mid_cap,all}  Company universe to screen
+--min-rodc FLOAT        Minimum RODC percentage
+--max-pe FLOAT          Maximum P/E ratio
+--max-pb FLOAT          Maximum P/B ratio
+--max-proximity FLOAT   Max proximity to 52w low, 0-1 (0.20 = within 20%)
+--min-margin FLOAT      Minimum operating margin percentage
+--top N                 Number of candidates to output (default: 50)
+--output FILE           Output filename
+--force-refresh         Ignore cache, fetch fresh data
+--offline               Use cached data only
+--cache-ttl DAYS        Cache TTL in days (default: 7)
+--api-key KEY           Massive.com API key
+```
+
+### Output Columns
+
+- **rank** - Ranking (1 = best opportunity)
+- **ticker** / **company_name** - Identifier
+- **proximity_to_52w_low** - 0.00 = at 52w low, 1.00 = at 52w high (lower = better)
+- **current_price** / **52w_low** / **52w_high** - Price context
+- **rodc_pct** - Return on Deployed Capital (Li Lu's key quality metric)
+- **pe_operating** - P/E on operating earnings (pre-tax, pre-interest)
+- **pb_ratio** - Price-to-Book
+- **operating_margin_pct** - Operating margin
+- **deployed_capital** - Capital deployed in operations (excludes ALL cash)
+- **asset_profile** - Asset intensity classification
+
+### Strong Screening Candidates
+
+- Proximity to 52w low: <0.10 (within 10%)
+- RODC: >30% (strong business), >50% = "not a bad business!" (Li Lu)
+- P/E: <15x on operating earnings
+- Operating margin: >10%
+
+### Performance
+
+- First run (S&P 500, ~500 companies): 15–20 minutes
+- Subsequent runs (with cache): 5–8 minutes (~70% cache hit rate)
+
+### Testing
+
+```bash
+# Quick test with 20 companies and relaxed filters
+python test_screener.py
+```
+
 ## Resources
 
 ### Scripts
@@ -212,6 +346,31 @@ python scripts/compare_companies.py PDD BABA AMZN
 - Displays comparison table with winners on each metric
 - Provides Li Lu's analysis and overall recommendation
 - Scoring system: Quality (0-3) + Value (0-3) = Total score
+
+**`screen_companies.py`**
+- Main screening orchestrator: screens 500+ companies for investment candidates
+- 5-step workflow: build universe → fetch data → filter → rank → export
+- 5 pre-built presets (52_week_low_quality, deep_value, li_lu_classic, cash_fortress, quality_any_price)
+- Smart SQLite caching reduces API calls by ~70% on subsequent runs
+- Outputs `screening_results.md` + `screening_results_summary.md`
+- Full CLI with 10+ filter options
+
+**`screening_config.py`**
+- Configuration management for the screening system
+- Defines the 5 pre-built screening presets with all filter parameters
+- Supports custom configuration with input validation
+
+**`company_universe.py`**
+- Fetches the company universe from Massive.com API (10,000+ US-listed companies)
+- Supports alphabetical filtering (e.g., all companies starting with 'A', or range 'A-C')
+- 24-hour cache TTL for the universe list
+- Handles paginated API requests with retry logic
+
+**`screening_cache.py`**
+- SQLite-based persistent cache at `~/.value_snapshot/cache/screening.db`
+- Caches: financial data, calculated metrics, 52-week price history, historical screening results
+- Automatic staleness detection; configurable TTL (default: 7 days)
+- Tracks cache hit/miss statistics per run
 
 ### References
 
@@ -295,6 +454,38 @@ Massive cash generation ($58.5B cash) raises capital allocation questions.
 3. Present formatted snapshot with ROIC interpretation
 4. Note asset profile (capital-intensive manufacturing vs software)
 
+### Example 4: Company Screening
+
+**User:** "Screen the S&P 500 for quality companies near 52-week lows"
+
+**Process:**
+```bash
+cd scripts
+python screen_companies.py --preset 52_week_low_quality
+```
+
+**Output files:**
+- `screening_results.md` - Full ranked list with all metrics
+- `screening_results_summary.md` - Human-readable summary with cache stats
+
+**User:** "Find companies with RODC over 50% trading near their lows, classic Li Lu style"
+
+```bash
+python screen_companies.py --preset li_lu_classic
+```
+
+**User:** "Deep value screen — extreme cheapness, near 52-week lows"
+
+```bash
+python screen_companies.py --preset deep_value --top 20
+```
+
+**User:** "Custom: RODC >35%, P/E <12, within 15% of 52-week low"
+
+```bash
+python screen_companies.py --min-rodc 35 --max-pe 12 --max-proximity 0.15
+```
+
 ## Tips - Li Lu's Approach
 
 - **Most important metric:** Operating Earnings (EBIT) - unlevered earning power
@@ -323,10 +514,14 @@ Massive cash generation ($58.5B cash) raises capital allocation questions.
   - SEC EDGAR covers all US-listed companies including foreign ADRs
   - Non-US companies not trading in US may need alternative sources
 - **Data freshness:** SEC EDGAR data updated after quarterly/annual filings (10-K, 10-Q, 20-F)
-  - Most recent data typically 1-3 months old
+  - Income statement metrics (revenue, operating income, margin) are **TTM** — rolling last four quarters
+  - Balance sheet metrics (cash, PP&E, working capital, goodwill) are a **point-in-time snapshot** from the most recent filing; not TTM
+  - Balance sheet can lag real events by up to ~3 months after a quarter closes
   - Market data (price, market cap) is real-time from Massive.com
 - **Simplified deployed capital:** Uses heuristic for excess cash (5% of revenue)
 - **No debt analysis:** Focuses on operating metrics, not capital structure details
 - **Requires API key:** Massive.com API key needed for real-time market data
+- **Screening dependencies:** `screen_companies.py` requires `pandas` and `tqdm` in addition to `requests`; use `conda activate cc_financial` or install manually
+- **Screening universe:** Default targets S&P 500 (~500 companies); small/mid-cap expansion (`--universe small_mid_cap`) is available but increases run time significantly
 
 For detailed methodology and interpretation, load the reference files as needed.
